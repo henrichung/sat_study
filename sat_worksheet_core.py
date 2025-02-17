@@ -24,6 +24,11 @@ import tempfile
 import uuid
 from PIL import Image as PILImage
 from xml.sax.saxutils import escape
+import base64
+import re  # Add this import at the top
+
+# Global cache for LaTeX rendered images
+latex_cache = {}
 
 def load_questions(file_path):
     with open(file_path, 'r') as f:
@@ -51,6 +56,11 @@ def shuffle_options(question):
 
 def latex_to_image(latex_str, dpi=300):
     """Convert LaTeX string to inline PNG image data using mathtext rendering."""
+    # Check cache first
+    if latex_str in latex_cache:
+        cached_data = latex_cache[latex_str]
+        return io.BytesIO(cached_data.getvalue())
+
     plt.rcParams.update({
         'backend': 'Agg',
         'text.usetex': False,  # Use mathtext for performance and compatibility
@@ -88,51 +98,66 @@ def latex_to_image(latex_str, dpi=300):
                     transparent=True,
                     dpi=dpi)
         img_data.seek(0)
+        # Store in cache (create a new BytesIO to preserve the data)
+        latex_cache[latex_str] = io.BytesIO(img_data.getvalue())
+        return img_data
     finally:
         plt.close(fig)
     
     return img_data
 
 def process_question_content(content, style, temp_dir, desired_height_pt=12):
-    """Process question content, handling both text with inline LaTeX and images.
-    Returns a Paragraph or Image flowable.
-    """
-    if isinstance(content, str):
-        parts = content.split('$')
-        if len(parts) > 1:  # Contains LaTeX parts
-            markup = ""
-            for i, part in enumerate(parts):
-                if i % 2 == 0:
-                    markup += escape(part)
-                else:
-                    try:
-                        img_data = latex_to_image(part)
-                        img_data.seek(0)
-                        pil_img = PILImage.open(io.BytesIO(img_data.getvalue()))
-                        width_px, height_px = pil_img.size
-                        width_pt = (width_px / 300) * 72
-                        height_pt = (height_px / 300) * 72
-                        scale = desired_height_pt / height_pt
-                        scaled_width = width_pt * scale
-                        scaled_height = desired_height_pt
-                        
-                        img_filename = os.path.join(temp_dir, f"latex_{uuid.uuid4().hex}.png")
-                        with open(img_filename, 'wb') as f:
-                            f.write(img_data.getvalue())
-    
-                        markup += f'<img src="{img_filename}" valign="middle" width="{scaled_width}" height="{scaled_height}"/>'
-                    except Exception as e:
-                        print(f"Warning: LaTeX rendering failed for '{part}': {str(e)}")
-                        markup += escape(f'${part}$')
-            return Paragraph(markup, style)
-        else:
-            return Paragraph(escape(content), style)
-    elif isinstance(content, dict):
-        # Support for embedding images directly from a file path
-        if 'image' in content:
-            img_path = content['image']
-            if os.path.exists(img_path):
-                return Image(img_path, width=6*inch)
+    """Process question content, handling both text with inline LaTeX and images."""
+    from reportlab.platypus import KeepTogether
+
+    if isinstance(content, dict):
+        text = content.get('text', '')
+        image_path = content.get('image', '')
+        
+        text_flowable = None
+        if text:
+            parts = text.split('$')
+            if len(parts) > 1:  # Contains LaTeX
+                markup = ""
+                for i, part in enumerate(parts):
+                    if i % 2 == 0:
+                        markup += escape(part)
+                    else:
+                        try:
+                            img_data = latex_to_image(part)
+                            img_data.seek(0)
+                            
+                            # Get PNG dimensions using PIL
+                            pil_img = PILImage.open(img_data)
+                            width_px, height_px = pil_img.size
+                            width_pt = (width_px / 300) * 72  # Convert from px at 300dpi to points
+                            height_pt = (height_px / 300) * 72
+                            scale_factor = desired_height_pt / height_pt
+                            scaled_width = width_pt * scale_factor
+                            
+                            # Convert to base64 and embed as PNG
+                            img_data.seek(0)
+                            b64_data = base64.b64encode(img_data.read()).decode('utf-8')
+                            markup += (f'<img src="data:image/png;base64,{b64_data}" '
+                                     f'width="{scaled_width}pt" height="{desired_height_pt}pt" '
+                                     f'valign="middle"/>')
+                        except Exception as e:
+                            print(f"Warning: LaTeX rendering failed for '{part}': {str(e)}")
+                            markup += escape(f'${part}$')
+                text_flowable = Paragraph(markup, style)
+            else:
+                text_flowable = Paragraph(escape(text), style)
+                
+        if image_path and os.path.exists(image_path):
+            image_flowable = Image(image_path, width=6*inch)
+            if text_flowable:
+                return KeepTogether([text_flowable, Spacer(1, 12), image_flowable])
+            return image_flowable
+        return text_flowable if text_flowable else Paragraph("", style)
+            
+    elif isinstance(content, str):
+        return Paragraph(escape(content), style)
+        
     return Paragraph("", style)
 
 def create_worksheet(questions, output_file, title, include_answers=False):
@@ -175,7 +200,7 @@ def create_worksheet(questions, output_file, title, include_answers=False):
             story.append(Spacer(1, 24))
     
     doc.build(story)
-
+    
 def validate_args(args, total_questions):
     if not os.path.exists(args.json_file):
         raise FileNotFoundError(f"JSON file not found: {args.json_file}")

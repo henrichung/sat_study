@@ -24,13 +24,12 @@ from PyQt5.QtGui import QStandardItemModel, QStandardItem
 from sat_worksheet_core import load_questions, filter_questions, shuffle_options, \
     create_worksheet, validate_args, distribute_questions
 
-# Import core functions for question browsing/editing
-from question_browser_core import load_questions as load_qs, save_questions
 
 class QuestionFormWidget(QWidget):
     def __init__(self):
         super().__init__()
         self.init_ui()
+        self.is_dirty = False
 
     def init_ui(self):
         form_layout = QFormLayout()
@@ -92,6 +91,17 @@ class QuestionFormWidget(QWidget):
         
         self.setLayout(form_layout)
 
+        # Connect change signals to mark_dirty
+        self.question_text_edit.textChanged.connect(self._mark_dirty)
+        self.question_image_edit.textChanged.connect(self._mark_dirty)
+        for opt in ['A', 'B', 'C', 'D']:
+            self.option_edits[opt]['text'].textChanged.connect(self._mark_dirty)
+            self.option_edits[opt]['image'].textChanged.connect(self._mark_dirty)
+        self.correct_answer_combo.currentTextChanged.connect(self._mark_dirty)
+        self.difficulty_edit.textChanged.connect(self._mark_dirty)
+        self.tags_edit.textChanged.connect(self._mark_dirty)
+        self.explanation_text_edit.textChanged.connect(self._mark_dirty)
+
     def browse_question_image(self):
         filename, _ = QFileDialog.getOpenFileName(self, "Select Question Image", "", 
             "Image Files (*.png *.jpg *.jpeg *.bmp *.gif)")
@@ -105,7 +115,7 @@ class QuestionFormWidget(QWidget):
             line_edit.setText(filename)
 
     def get_question_data(self):
-        return {
+        data = {
             "question": {
                 "text": self.question_text_edit.toPlainText().strip(),
                 "image": self.question_image_edit.text().strip()
@@ -121,13 +131,20 @@ class QuestionFormWidget(QWidget):
             "tags": [t.strip() for t in self.tags_edit.text().split(",") if t.strip()],
             "explanation": {
                 "text": self.explanation_text_edit.toPlainText().strip()
-            }
+            },
+            "_dirty": self.is_dirty  # Add dirty flag to the data
         }
+        self.is_dirty = False  # Reset dirty flag after getting data
+        return data
 
     def set_question_data(self, question):
         if not question:
             self.clear()
             return
+
+        # Remove dirty flag if present
+        question = question.copy()
+        question.pop('_dirty', None)
 
         self.question_text_edit.setPlainText(question.get("question", {}).get("text", ""))
         self.question_image_edit.setText(question.get("question", {}).get("image", ""))
@@ -150,6 +167,7 @@ class QuestionFormWidget(QWidget):
         self.difficulty_edit.setText(question.get("difficulty", ""))
         self.tags_edit.setText(", ".join(question.get("tags", [])))
         self.explanation_text_edit.setPlainText(question.get("explanation", {}).get("text", ""))
+        self.is_dirty = False  # Reset dirty flag when loading new data
 
     def clear(self):
         self.question_text_edit.clear()
@@ -161,6 +179,9 @@ class QuestionFormWidget(QWidget):
         self.difficulty_edit.clear()
         self.tags_edit.clear()
         self.explanation_text_edit.clear()
+
+    def _mark_dirty(self):
+        self.is_dirty = True
 
 # -------------------- Worksheet Generator Widget -------------------- #
 class WorksheetGeneratorWidget(QWidget):
@@ -333,6 +354,11 @@ class QuestionBrowserWidget(QWidget):
         self.questions = []
         self.current_question_index = None
         self.json_file_path = None
+        self.questions_generator = None
+        self.loading_more = False
+        self.chunk_size = 100
+        self.updated_questions = []
+        self.deleted_questions = []
         self.init_ui()
         self.load_questions()
 
@@ -362,6 +388,8 @@ class QuestionBrowserWidget(QWidget):
         # Split view with models
         splitter = QSplitter(Qt.Horizontal)
         self.question_list = QListView()
+        self.question_list.setVerticalScrollMode(QListView.ScrollPerPixel)  # Smooth scrolling
+        self.question_list.wheelEvent = self.on_list_wheel  # Override wheel event
         self.model = QStandardItemModel()
         self.proxyModel = QSortFilterProxyModel()
         self.proxyModel.setSourceModel(self.model)
@@ -411,7 +439,22 @@ class QuestionBrowserWidget(QWidget):
             return
             
         try:
-            self.questions = load_qs(self.json_file_path)
+            # Get the generator
+            self.questions_generator = json_utils.yield_questions(self.json_file_path)
+            
+            # Clear existing data
+            self.questions = []
+            self.model.clear()
+            
+            # Load first chunk of questions
+            chunk_size = 100
+            for _ in range(chunk_size):
+                try:
+                    question = next(self.questions_generator)
+                    self.questions.append(question)
+                except StopIteration:
+                    break
+            
             self.populate_list()
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load questions: {str(e)}")
@@ -433,17 +476,21 @@ class QuestionBrowserWidget(QWidget):
             QMessageBox.critical(self, "Error", "No JSON file selected.")
             return
 
+        # Commit any pending changes
+        self.commit_current_question()
+
         try:
-            json_utils.save_questions(self.json_file_path, self.questions)
+            json_utils.save_questions(
+                self.json_file_path,
+                self.updated_questions,
+                self.deleted_questions
+            )
+            # Clear the lists after successful save
+            self.updated_questions = []
+            self.deleted_questions = []
             QMessageBox.information(self, "Success", "Changes saved successfully!")
-        except FileNotFoundError:
-            QMessageBox.critical(self, "Error", "The specified JSON file location is not accessible.")
-        except json.JSONDecodeError:
-            QMessageBox.critical(self, "Error", "Failed to encode questions as JSON.")
-        except IOError as e:
-            QMessageBox.critical(self, "Error", f"Failed to write to file: {str(e)}")
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"An unexpected error occurred: {str(e)}")
+            QMessageBox.critical(self, "Error", f"Failed to save changes: {str(e)}")
 
     def on_question_selected(self):
         selected_indexes = self.question_list.selectedIndexes()
@@ -464,18 +511,66 @@ class QuestionBrowserWidget(QWidget):
     def commit_current_question(self):
         if self.current_question_index is None:
             return
-        self.questions[self.current_question_index] = self.question_form.get_question_data()
+            
+        updated_data = self.question_form.get_question_data()
+        if updated_data.pop('_dirty', False):  # Remove and check dirty flag
+            self.questions[self.current_question_index] = updated_data
+            if updated_data not in self.updated_questions:
+                self.updated_questions.append(updated_data)
+        
         self.populate_list()
 
     def delete_question(self):
         if self.current_question_index is None:
             return
-        reply = QMessageBox.question(self, "Delete Question", "Are you sure you want to delete this question?", QMessageBox.Yes | QMessageBox.No)
+            
+        reply = QMessageBox.question(
+            self, "Delete Question",
+            "Are you sure you want to delete this question?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        
         if reply == QMessageBox.Yes:
-            del self.questions[self.current_question_index]
+            # Add question to deleted_questions list before removing it
+            question_to_delete = self.questions[self.current_question_index]
+            if question_to_delete not in self.deleted_questions:
+                self.deleted_questions.append(question_to_delete)
+            
+            # Remove from questions list
+            self.questions.pop(self.current_question_index)
             self.current_question_index = None
             self.populate_list()
             self.question_form.clear()
+            
+            # Save changes automatically
+            self.save_changes()
+
+    def on_list_wheel(self, event):
+        # Call the parent class's wheel event first
+        QListView.wheelEvent(self.question_list, event)
+        
+        # Check if we're near the bottom
+        scrollbar = self.question_list.verticalScrollBar()
+        if (scrollbar.value() >= scrollbar.maximum() - 50  # Within 50 pixels of bottom
+            and not self.loading_more 
+            and self.questions_generator is not None):
+            
+            self.loading_more = True  # Set loading flag
+            try:
+                # Load next chunk
+                loaded = 0
+                for _ in range(self.chunk_size):
+                    try:
+                        question = next(self.questions_generator)
+                        self.questions.append(question)
+                        loaded += 1
+                    except StopIteration:
+                        break
+                
+                if loaded > 0:
+                    self.populate_list()
+            finally:
+                self.loading_more = False
 
 class MainWindow(QMainWindow):
     def __init__(self):
