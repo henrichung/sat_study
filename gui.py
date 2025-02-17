@@ -29,7 +29,8 @@ class QuestionFormWidget(QWidget):
     def __init__(self):
         super().__init__()
         self.init_ui()
-        self.is_dirty = False
+        self.original_data = None  # Store original question data
+
 
     def init_ui(self):
         form_layout = QFormLayout()
@@ -142,9 +143,8 @@ class QuestionFormWidget(QWidget):
             self.clear()
             return
 
-        # Remove dirty flag if present
-        question = question.copy()
-        question.pop('_dirty', None)
+        # Store a deep copy of the original question data
+        self.original_data = question.copy()
 
         self.question_text_edit.setPlainText(question.get("question", {}).get("text", ""))
         self.question_image_edit.setText(question.get("question", {}).get("image", ""))
@@ -167,18 +167,74 @@ class QuestionFormWidget(QWidget):
         self.difficulty_edit.setText(question.get("difficulty", ""))
         self.tags_edit.setText(", ".join(question.get("tags", [])))
         self.explanation_text_edit.setPlainText(question.get("explanation", {}).get("text", ""))
-        self.is_dirty = False  # Reset dirty flag when loading new data
 
+    def get_question_data(self):
+        current_data = {
+            "question": {
+                "text": self.question_text_edit.toPlainText().strip(),
+                "image": self.question_image_edit.text().strip()
+            },
+            "options": {
+                opt: {
+                    "text": self.option_edits[opt]['text'].text().strip(),
+                    "image": self.option_edits[opt]['image'].text().strip()
+                } for opt in ['A', 'B', 'C', 'D']
+            },
+            "answer": self.correct_answer_combo.currentText(),
+            "difficulty": self.difficulty_edit.text().strip(),
+            "tags": [t.strip() for t in self.tags_edit.text().split(",") if t.strip()],
+            "explanation": {
+                "text": self.explanation_text_edit.toPlainText().strip()
+            }
+        }
+
+        # Compare with original data to determine if dirty
+        is_dirty = self._is_data_changed(current_data)
+        current_data["_dirty"] = is_dirty
+        return current_data
+
+    def _is_data_changed(self, current_data):
+        if self.original_data is None:
+            return True
+
+        # Compare relevant fields
+        fields_to_compare = [
+            ("question", ["text", "image"]),
+            ("options", ["A", "B", "C", "D"]),
+            ("answer", None),
+            ("difficulty", None),
+            ("tags", None),
+            ("explanation", ["text"])
+        ]
+
+        for field, subfields in fields_to_compare:
+            if field not in self.original_data or field not in current_data:
+                return True
+
+            if subfields is None:
+                if self.original_data[field] != current_data[field]:
+                    return True
+            else:
+                orig = self.original_data[field]
+                curr = current_data[field]
+                
+                if isinstance(orig, dict) and isinstance(curr, dict):
+                    for subfield in subfields:
+                        if subfield in orig and subfield in curr:
+                            if isinstance(orig[subfield], dict) and isinstance(curr[subfield], dict):
+                                if orig[subfield].get("text") != curr[subfield].get("text") or \
+                                   orig[subfield].get("image") != curr[subfield].get("image"):
+                                    return True
+                            elif orig[subfield] != curr[subfield]:
+                                return True
+                        else:
+                            return True
+
+        return False
+    
     def clear(self):
-        self.question_text_edit.clear()
-        self.question_image_edit.clear()
-        for opt in ['A', 'B', 'C', 'D']:
-            self.option_edits[opt]['text'].clear()
-            self.option_edits[opt]['image'].clear()
-        self.correct_answer_combo.setCurrentIndex(0)
-        self.difficulty_edit.clear()
-        self.tags_edit.clear()
-        self.explanation_text_edit.clear()
+        super().clear()
+        self.original_data = None
 
     def _mark_dirty(self):
         self.is_dirty = True
@@ -187,6 +243,7 @@ class QuestionFormWidget(QWidget):
 class WorksheetGeneratorWidget(QWidget):
     def __init__(self):
         super().__init__()
+        self.all_questions = []  # Add this line
         self.init_ui()
     
     def init_ui(self):
@@ -228,7 +285,15 @@ class WorksheetGeneratorWidget(QWidget):
     def browse_json_file(self):
         filename, _ = QFileDialog.getOpenFileName(self, "Select JSON File", "", "JSON Files (*.json)")
         if filename:
-            self.json_file_edit.setText(filename)
+            try:
+                # Load questions once when file is selected
+                self.all_questions = json_utils.load_questions(filename)
+                self.json_file_edit.setText(filename)
+                QMessageBox.information(self, "Success", f"Loaded {len(self.all_questions)} questions successfully!")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to load questions:\n{str(e)}")
+                self.all_questions = []
+                self.json_file_edit.clear()
     
     def browse_output_dir(self):
         directory = QFileDialog.getExistingDirectory(self, "Select Output Directory", os.getcwd())
@@ -236,13 +301,13 @@ class WorksheetGeneratorWidget(QWidget):
             self.output_dir_edit.setText(directory)
     
     def generate_worksheets(self):
-        json_path = self.json_file_edit.text().strip()
-        if not os.path.exists(json_path):
-            QMessageBox.critical(self, "Error", "JSON file not found!")
+        if not self.all_questions:
+            QMessageBox.critical(self, "Error", "No questions loaded! Please select a JSON file first.")
             return
-        
+
         worksheet_title = self.title_edit.text().strip() or "Worksheet"
         tags = [t.strip() for t in self.tags_edit.text().split(",")] if self.tags_edit.text().strip() else []
+        
         try:
             num_questions = int(self.num_questions_edit.text().strip()) if self.num_questions_edit.text().strip() else None
             pages = int(self.pages_edit.text().strip())
@@ -257,8 +322,8 @@ class WorksheetGeneratorWidget(QWidget):
             return
         
         try:
-            questions = load_questions(json_path)
-            filtered_questions = filter_questions(questions, tags)
+            # Use already loaded questions instead of loading again
+            filtered_questions = filter_questions(self.all_questions, tags)
             
             if self.shuffle_checkbox.isChecked():
                 random.shuffle(filtered_questions)
@@ -269,7 +334,7 @@ class WorksheetGeneratorWidget(QWidget):
                 filtered_questions = filtered_questions[:num_questions]
             
             args = SimpleNamespace(
-                json_file=json_path,
+                json_file=self.json_file_edit.text().strip(),
                 num_questions=num_questions,
                 pages=pages,
                 n_max=n_max,
@@ -333,7 +398,10 @@ class QuestionGeneratorWidget(QWidget):
         question_dict = self.question_form.get_question_data()
         
         try:
-            json_utils.append_question(question_dict, json_file)
+            # Create Question object from dictionary
+            question = json_utils.Question.from_dict(question_dict)
+            # Now pass both the json_file path and Question object
+            json_utils.append_question(json_file, question)
             QMessageBox.information(self, "Success", "Question saved successfully!")
             self.clear_fields()
         except Exception as e:
@@ -354,73 +422,76 @@ class QuestionBrowserWidget(QWidget):
         self.questions = []
         self.current_question_index = None
         self.json_file_path = None
-        self.questions_generator = None
+        self.index_file_path = None
+        self.index = None
         self.loading_more = False
         self.chunk_size = 100
-        self.updated_questions = []
-        self.deleted_questions = []
         self.init_ui()
-        self.load_questions()
 
     def init_ui(self):
-        main_layout = QVBoxLayout()
+        layout = QVBoxLayout()
+        
         # JSON file selection
         file_layout = QHBoxLayout()
         self.json_file_edit = QLineEdit()
-        browse_file_btn = QPushButton("Browse...")
-        browse_file_btn.clicked.connect(self.browse_json_file)
-        load_btn = QPushButton("Load Questions")
+        self.json_file_edit.setPlaceholderText("Select JSON file to browse/edit")
+        json_btn = QPushButton("Browse...")
+        json_btn.clicked.connect(self.browse_json_file)
+        load_btn = QPushButton("Load")
         load_btn.clicked.connect(self.load_questions)
-        file_layout.addWidget(QLabel("JSON File:"))
         file_layout.addWidget(self.json_file_edit)
-        file_layout.addWidget(browse_file_btn)
+        file_layout.addWidget(json_btn)
         file_layout.addWidget(load_btn)
-        main_layout.addLayout(file_layout)
+        layout.addLayout(file_layout)
         
-        # Filter/search field
+        # Search/Filter
         filter_layout = QHBoxLayout()
-        filter_layout.addWidget(QLabel("Search/Filter:"))
         self.filter_edit = QLineEdit()
+        self.filter_edit.setPlaceholderText("Search questions...")
         self.filter_edit.textChanged.connect(self.filter_questions)
         filter_layout.addWidget(self.filter_edit)
-        main_layout.addLayout(filter_layout)
+        layout.addLayout(filter_layout)
         
-        # Split view with models
+        # Split view: list on left, form on right
         splitter = QSplitter(Qt.Horizontal)
-        self.question_list = QListView()
-        self.question_list.setVerticalScrollMode(QListView.ScrollPerPixel)  # Smooth scrolling
-        self.question_list.wheelEvent = self.on_list_wheel  # Override wheel event
+        
+        # Question list
         self.model = QStandardItemModel()
         self.proxyModel = QSortFilterProxyModel()
         self.proxyModel.setSourceModel(self.model)
+        self.proxyModel.setFilterCaseSensitivity(Qt.CaseInsensitive)
+        
+        self.question_list = QListView()
         self.question_list.setModel(self.proxyModel)
-        self.question_list.selectionModel().selectionChanged.connect(self.on_question_selected)
+        self.question_list.selectionModel().selectionChanged.connect(
+            lambda: self.on_question_selected())
+        self.question_list.wheelEvent = self.on_list_wheel
         splitter.addWidget(self.question_list)
         
-        # Form widget setup
-        form_widget = QWidget()
-        form_layout = QVBoxLayout()
+        # Question form
         self.question_form = QuestionFormWidget()
-        form_layout.addWidget(self.question_form)
+        splitter.addWidget(self.question_form)
+        
+        layout.addWidget(splitter)
         
         # Buttons
-        self.delete_btn = QPushButton("Delete Question")
-        self.delete_btn.clicked.connect(self.delete_question)
-        self.save_btn = QPushButton("Save Changes")
-        self.save_btn.clicked.connect(self.save_changes)
-        form_layout.addWidget(self.save_btn)
-        form_layout.addWidget(self.delete_btn)
+        button_layout = QHBoxLayout()
+        delete_btn = QPushButton("Delete Question")
+        delete_btn.clicked.connect(self.delete_question)
+        button_layout.addWidget(delete_btn)
+        layout.addLayout(button_layout)
         
-        form_widget.setLayout(form_layout)
-        splitter.addWidget(form_widget)
-        splitter.setSizes([200, 400])
-        main_layout.addWidget(splitter)
-        self.setLayout(main_layout)
+        self.setLayout(layout)
 
     def browse_json_file(self):
-        filename, _ = QFileDialog.getOpenFileName(self, "Select JSON File", "", "JSON Files (*.json)")
+        filename, _ = QFileDialog.getOpenFileName(
+            self, "Select JSON File", "", "JSON Files (*.json)")
         if filename:
             self.json_file_edit.setText(filename)
+
+    def filter_questions(self):
+        search_text = self.filter_edit.text()
+        self.proxyModel.setFilterRegExp(search_text)
 
     def load_questions(self):
         self.json_file_path = self.json_file_edit.text().strip()
@@ -428,69 +499,51 @@ class QuestionBrowserWidget(QWidget):
             QMessageBox.critical(self, "Error", "Please select a JSON file.")
             return
             
-        if not os.path.exists(self.json_file_path):
-            self.questions = []
-            QMessageBox.information(
-                self,
-                "New File",
-                "The specified JSON file doesn't exist. A new file will be created when saving."
-            )
-            self.populate_list()
-            return
+        # Set index file path
+        base, ext = os.path.splitext(self.json_file_path)
+        self.index_file_path = f"{base}_index{ext}"
             
         try:
-            # Get the generator
-            self.questions_generator = json_utils.yield_questions(self.json_file_path)
+            # Load questions directly first to validate JSON
+            questions = json_utils.load_questions(self.json_file_path)
+            
+            # Initialize or load index
+            if os.path.exists(self.index_file_path):
+                self.index = json_utils.load_index(self.index_file_path)
+            else:
+                self.index = json_utils.create_index(self.json_file_path, self.index_file_path)
+                
+            # Ensure index is not None
+            if self.index is None:
+                self.index = {}
             
             # Clear existing data
-            self.questions = []
+            self.questions = questions
             self.model.clear()
             
-            # Load first chunk of questions
-            chunk_size = 100
-            for _ in range(chunk_size):
-                try:
-                    question = next(self.questions_generator)
-                    self.questions.append(question)
-                except StopIteration:
-                    break
+            if not self.questions:
+                QMessageBox.information(
+                    self,
+                    "Empty File",
+                    "The JSON file is empty or contains no valid questions."
+                )
+                return
             
             self.populate_list()
+            
+        except json.JSONDecodeError as e:
+            QMessageBox.critical(self, "Error", f"Invalid JSON file: {str(e)}")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load questions: {str(e)}")
 
     def populate_list(self):
         self.model.clear()
-        for i, q in enumerate(self.questions):
-            question_text = q.get("question", {}).get("text", "")
-            display_text = f"{i+1}: {question_text[:50]}"
+        for i, question in enumerate(self.questions):
+            question_text = question.text[:50] if hasattr(question, 'text') else ""
+            display_text = f"{i+1}: {question_text}"
             item = QStandardItem(display_text)
-            item.setData(i, Qt.UserRole)
+            item.setData(question.uid, Qt.UserRole)  # Store question UID instead of index
             self.model.appendRow(item)
-
-    def filter_questions(self):
-        self.proxyModel.setFilterFixedString(self.filter_edit.text())
-
-    def save_changes(self):
-        if not self.json_file_path:
-            QMessageBox.critical(self, "Error", "No JSON file selected.")
-            return
-
-        # Commit any pending changes
-        self.commit_current_question()
-
-        try:
-            json_utils.save_questions(
-                self.json_file_path,
-                self.updated_questions,
-                self.deleted_questions
-            )
-            # Clear the lists after successful save
-            self.updated_questions = []
-            self.deleted_questions = []
-            QMessageBox.information(self, "Success", "Changes saved successfully!")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to save changes: {str(e)}")
 
     def on_question_selected(self):
         selected_indexes = self.question_list.selectedIndexes()
@@ -501,22 +554,33 @@ class QuestionBrowserWidget(QWidget):
         
         selected_index = selected_indexes[0]
         model_index = self.proxyModel.mapToSource(selected_index)
-        index = model_index.data(Qt.UserRole)
+        question_uid = model_index.data(Qt.UserRole)
         self.commit_current_question()
         
-        self.current_question_index = index
-        question = self.questions[index]
-        self.question_form.set_question_data(question)
+        # Find question index in our list
+        for i, q in enumerate(self.questions):
+            if q.uid == question_uid:
+                self.current_question_index = i
+                break
+        
+        if self.current_question_index is not None:
+            question = self.questions[self.current_question_index]
+            self.question_form.set_question_data(question.to_dict())
 
     def commit_current_question(self):
         if self.current_question_index is None:
             return
             
         updated_data = self.question_form.get_question_data()
-        if updated_data.pop('_dirty', False):  # Remove and check dirty flag
-            self.questions[self.current_question_index] = updated_data
-            if updated_data not in self.updated_questions:
-                self.updated_questions.append(updated_data)
+        if updated_data.pop('_dirty', False):
+            question = self.questions[self.current_question_index]
+            json_utils.update_question(self.json_file_path, question.uid, updated_data)
+            # Update index if needed (e.g., if tags changed)
+            self.index = json_utils.update_index(self.index, question.uid, updated_data)
+            json_utils.save_index(self.index, self.index_file_path)
+            
+            # Update in-memory question
+            self.questions[self.current_question_index] = json_utils.Question.from_dict(updated_data)
         
         self.populate_list()
 
@@ -531,47 +595,49 @@ class QuestionBrowserWidget(QWidget):
         )
         
         if reply == QMessageBox.Yes:
-            # Add question to deleted_questions list before removing it
-            question_to_delete = self.questions[self.current_question_index]
-            if question_to_delete not in self.deleted_questions:
-                self.deleted_questions.append(question_to_delete)
+            question = self.questions[self.current_question_index]
+            json_utils.delete_question(self.json_file_path, question.uid)
+            
+            # Update index
+            if question.uid in self.index:
+                del self.index[question.uid]
+                json_utils.save_index(self.index, self.index_file_path)
             
             # Remove from questions list
             self.questions.pop(self.current_question_index)
             self.current_question_index = None
             self.populate_list()
             self.question_form.clear()
-            
-            # Save changes automatically
-            self.save_changes()
+
+    def save_changes(self):
+        json_utils.save_index(self.index, self.index_file_path)
 
     def on_list_wheel(self, event):
-        # Call the parent class's wheel event first
         QListView.wheelEvent(self.question_list, event)
         
-        # Check if we're near the bottom
         scrollbar = self.question_list.verticalScrollBar()
-        if (scrollbar.value() >= scrollbar.maximum() - 50  # Within 50 pixels of bottom
+        if (scrollbar.value() >= scrollbar.maximum() - 50
             and not self.loading_more 
-            and self.questions_generator is not None):
+            and self.index):
             
-            self.loading_more = True  # Set loading flag
+            self.loading_more = True
             try:
-                # Load next chunk
-                loaded = 0
-                for _ in range(self.chunk_size):
-                    try:
-                        question = next(self.questions_generator)
-                        self.questions.append(question)
-                        loaded += 1
-                    except StopIteration:
-                        break
+                # Calculate which UIDs to load next
+                current_uids = {q.uid for q in self.questions}
+                all_uids = list(self.index.keys())
+                next_uids = [uid for uid in all_uids if uid not in current_uids][:self.chunk_size]
                 
-                if loaded > 0:
+                # Load next chunk of questions
+                for uid in next_uids:
+                    question = json_utils.get_question_by_uid(self.json_file_path, uid)
+                    if question:
+                        self.questions.append(question)
+                
+                if next_uids:
                     self.populate_list()
             finally:
                 self.loading_more = False
-
+                
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
