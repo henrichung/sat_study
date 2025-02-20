@@ -11,20 +11,123 @@ import os
 import random
 import json
 import json_utils
-from uuid import uuid4
 from types import SimpleNamespace
 
 from PyQt5.QtWidgets import (QApplication, QWidget, QMainWindow, QFileDialog,
                              QMessageBox, QPushButton, QLabel, QLineEdit, QCheckBox,
                              QFormLayout, QHBoxLayout, QVBoxLayout, QTabWidget, QTextEdit,
                              QComboBox, QListWidget, QSplitter, QListView)
-from PyQt5.QtCore import Qt, QSortFilterProxyModel
+from PyQt5.QtCore import Qt, QSortFilterProxyModel, QRunnable, QThreadPool, pyqtSignal, QObject
 from PyQt5.QtGui import QStandardItemModel, QStandardItem
 
 # Import worksheet generator functions (existing module)
 from sat_worksheet_core import load_questions, filter_questions, shuffle_options, \
     create_worksheet, validate_args, distribute_questions
 
+
+class WorkerSignals(QObject):
+    finished = pyqtSignal()
+    error = pyqtSignal(Exception)
+    result = pyqtSignal(object)
+    progress = pyqtSignal(int)
+
+class BaseWorker(QRunnable):
+    def __init__(self):
+        super().__init__()
+        self.signals = WorkerSignals()
+
+class LoadQuestionsWorker(BaseWorker):
+    def __init__(self, json_file):
+        super().__init__()
+        self.json_file = json_file
+
+    def run(self):
+        try:
+            questions = json_utils.load_questions(self.json_file)
+            self.signals.result.emit(questions)
+            self.signals.finished.emit()
+        except Exception as e:
+            self.signals.error.emit(e)
+
+class SaveQuestionWorker(BaseWorker):
+    def __init__(self, json_file, question, index_file=None, index=None, is_new=False):
+        super().__init__()
+        self.json_file = json_file
+        self.question = question
+        self.index_file = index_file
+        self.index = index
+        self.is_new = is_new
+
+    def run(self):
+        try:
+            if self.is_new:
+                json_utils.append_question(self.json_file, self.question)
+            else:
+                json_utils.save_questions(self.json_file, [self.question])
+
+            # Modified index handling
+            if self.index is not None and self.index_file:
+                if self.question.uid not in self.index:
+                    self.index.append(self.question.uid)
+                json_utils.save_index(self.index, self.index_file)
+
+            self.signals.result.emit(self.question)
+            self.signals.finished.emit()
+        except Exception as e:
+            self.signals.error.emit(e)
+
+class DeleteQuestionWorker(BaseWorker):
+    def __init__(self, json_file, uid, index_file=None, index=None):
+        super().__init__()
+        self.json_file = json_file
+        self.uid = uid
+        self.index_file = index_file
+        self.index = index
+
+    def run(self):
+        try:
+            json_utils.delete_question(self.json_file, self.index, self.uid)
+            
+            if self.index is not None:
+                # Remove the UID from the index list if it exists
+                if self.uid in self.index:
+                    self.index.remove(self.uid)
+                    if self.index_file:
+                        json_utils.save_index(self.index, self.index_file)
+
+            self.signals.finished.emit()
+        except Exception as e:
+            self.signals.error.emit(e)
+
+class GenerateWorksheetsWorker(BaseWorker):
+    def __init__(self, questions, output_dir, worksheet_title, pages, n_max):
+        super().__init__()
+        self.questions = questions
+        self.output_dir = output_dir
+        self.worksheet_title = worksheet_title
+        self.pages = pages
+        self.n_max = n_max
+
+    def run(self):
+        try:
+            distributed_questions = distribute_questions(self.questions, self.pages, self.n_max)
+            
+            total_pages = len(distributed_questions)
+            for i, page_questions in enumerate(distributed_questions, 1):
+                self.signals.progress.emit(int((i / total_pages) * 100))
+                
+                base_name = self.worksheet_title.replace(' ', '_')
+                output_file = os.path.join(self.output_dir, f"{base_name}_Page_{i}.pdf")
+                create_worksheet(page_questions, output_file, f"{self.worksheet_title} - Page {i}")
+                
+                answer_key_file = os.path.join(self.output_dir, f"{base_name}_Page_{i}_answer_key.pdf")
+                create_worksheet(page_questions, answer_key_file, 
+                               f"{self.worksheet_title} - Page {i} (Answer Key)", 
+                               include_answers=True)
+
+            self.signals.finished.emit()
+        except Exception as e:
+            self.signals.error.emit(e)
 
 class QuestionFormWidget(QWidget):
     def __init__(self):
@@ -137,10 +240,7 @@ class QuestionFormWidget(QWidget):
             text=self.explanation_text_edit.toPlainText().strip()
         )
         
-        # Explicitly handle UID
-        existing_uid = self.original_data.uid if self.original_data else None
-        
-        # Create Question object with explicit UID handling
+        # Create Question object
         question = json_utils.Question(
             content=content,
             options=options,
@@ -148,12 +248,12 @@ class QuestionFormWidget(QWidget):
             difficulty=self.difficulty_edit.text().strip(),
             tags=[t.strip() for t in self.tags_edit.text().split(",") if t.strip()],
             explanation=explanation,
-            uid=existing_uid  # Pass existing UID or None for new questions
+            uid=getattr(self.original_data, 'uid', None)
         )
         
         # Set dirty flag based on whether this is a new question or data has changed
         is_dirty = not self._compare_questions(question, self.original_data)
-        question._dirty = is_dirty
+        question._dirty = is_dirty  # Add temporary attribute
         return question
 
     def set_question_data(self, question: json_utils.Question):
@@ -202,6 +302,7 @@ class WorksheetGeneratorWidget(QWidget):
         super().__init__()
         self.all_questions = []  # Add this line
         self.init_ui()
+        self.threadpool = QThreadPool()
     
     def init_ui(self):
         # (Existing code unchanged)
@@ -298,18 +399,29 @@ class WorksheetGeneratorWidget(QWidget):
                 tags=tags
             )
             validate_args(args, len(filtered_questions))
-            distributed_questions = distribute_questions(filtered_questions, pages, n_max)
-            
-            for i, page_questions in enumerate(distributed_questions, 1):
-                base_name = worksheet_title.replace(' ', '_')
-                output_file = os.path.join(output_dir, f"{base_name}_Page_{i}.pdf")
-                create_worksheet(page_questions, output_file, f"{worksheet_title} - Page {i}")
-                answer_key_file = os.path.join(output_dir, f"{base_name}_Page_{i}_answer_key.pdf")
-                create_worksheet(page_questions, answer_key_file, f"{worksheet_title} - Page {i} (Answer Key)", include_answers=True)
-            
-            QMessageBox.information(self, "Success", "Worksheets generated successfully!")
+            self.generate_btn.setEnabled(False)
+            worker = GenerateWorksheetsWorker(
+                filtered_questions, output_dir, 
+                worksheet_title, pages, n_max
+            )
+            worker.signals.finished.connect(self.handle_generate_finished)
+            worker.signals.error.connect(self.handle_generate_error)
+            worker.signals.progress.connect(self.update_progress)
+            self.threadpool.start(worker)
         except Exception as e:
             QMessageBox.critical(self, "Error", f"An error occurred:\n{str(e)}")
+
+    def handle_generate_finished(self):
+        self.generate_btn.setEnabled(True)
+        QMessageBox.information(self, "Success", "Worksheets generated successfully!")
+
+    def handle_generate_error(self, error):
+        self.generate_btn.setEnabled(True)
+        QMessageBox.critical(self, "Error", f"An error occurred:\n{str(error)}")
+
+    def update_progress(self, value):
+        # Optional: Add progress bar to show worksheet generation progress
+        pass
 
 # -------------------- New: Question Manager Widget -------------------- #
 class QuestionManagerWidget(QWidget):
@@ -323,6 +435,7 @@ class QuestionManagerWidget(QWidget):
         self.loading_more = False
         self.chunk_size = 100
         self.init_ui()
+        self.threadpool = QThreadPool()
 
     def init_ui(self):
         layout = QVBoxLayout()
@@ -403,24 +516,26 @@ class QuestionManagerWidget(QWidget):
     def initialize_index(self):
         """Initialize or load the question index for the current JSON file."""
         if not self.index_file_path:
-            return {}
+            return []
             
         try:
             if os.path.exists(self.index_file_path):
-                self.index = json_utils.load_index(self.index_file_path)
+                index = json_utils.load_index(self.index_file_path)
+                # Ensure index is a list of UIDs
+                if isinstance(index, dict):
+                    index = list(index.keys())
+                return index if isinstance(index, list) else []
             else:
-                self.index = json_utils.create_index(self.json_file_path, self.index_file_path)
-            
-            # Handle potential errors during index creation
-            if self.index is None:
-                self.index = {}
-                
-            return self.index
+                # Create new index as list of UIDs
+                questions = json_utils.load_questions(self.json_file_path)
+                index = [q.uid for q in questions]
+                json_utils.save_index(index, self.index_file_path)
+                return index
                 
         except Exception as e:
             QMessageBox.warning(self, "Index Error", 
                 f"Failed to initialize index:\n{str(e)}\nUsing empty index.")
-            return {}
+            return []
 
     def load_questions(self):
         self.json_file_path = self.json_file_edit.text().strip()
@@ -432,31 +547,23 @@ class QuestionManagerWidget(QWidget):
         base, ext = os.path.splitext(self.json_file_path)
         self.index_file_path = f"{base}_index{ext}"
             
-        try:
-            # Load questions directly first to validate JSON
-            questions = json_utils.load_questions(self.json_file_path)
-            
-            # Initialize index after JSON validation
-            self.index = self.initialize_index()
-            
-            # Clear existing data
-            self.questions = questions
-            self.model.clear()
-            
-            if not self.questions:
-                QMessageBox.information(
-                    self,
-                    "Empty File",
-                    "The JSON file is empty or contains no valid questions."
-                )
-                return
-            
-            self.populate_list()
-            
-        except json.JSONDecodeError as e:
-            QMessageBox.critical(self, "Error", f"Invalid JSON file: {str(e)}")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to load questions: {str(e)}")
+        # Disable UI
+        self.setEnabled(False)
+        
+        # Create and run worker
+        worker = LoadQuestionsWorker(self.json_file_path)
+        worker.signals.result.connect(self.handle_load_result)
+        worker.signals.error.connect(self.handle_load_error)
+        worker.signals.finished.connect(lambda: self.setEnabled(True))
+        self.threadpool.start(worker)
+
+    def handle_load_result(self, questions):
+        self.questions = questions
+        self.index = self.initialize_index()
+        self.populate_list()
+
+    def handle_load_error(self, error):
+        QMessageBox.critical(self, "Error", f"Failed to load questions: {str(error)}")
 
     def populate_list(self):
         """Populate the list with Question objects."""
@@ -511,7 +618,7 @@ class QuestionManagerWidget(QWidget):
     def delete_question(self):
         if self.current_question_index is None:
             return
-                
+            
         reply = QMessageBox.question(
             self, "Delete Question",
             "Are you sure you want to delete this question?",
@@ -519,30 +626,36 @@ class QuestionManagerWidget(QWidget):
         )
         
         if reply == QMessageBox.Yes:
-            try:
-                question = self.questions[self.current_question_index]
-                
-                # Delete from file and index
-                json_utils.delete_question(self.json_file_path, self.index, question.uid)
-                
-                # Save index changes immediately
-                if self.index_file_path:
-                    json_utils.save_index(self.index, self.index_file_path)
-                
-                # Remove from questions list
-                self.questions.pop(self.current_question_index)
-                self.current_question_index = None
-                
-                # Update UI
-                self.populate_list()
-                self.question_form.clear()
-                self.save_question_btn.setVisible(False)
-                self.delete_btn.setVisible(False)
-                
-                QMessageBox.information(self, "Success", "Question deleted successfully")
-                
-            except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to delete question: {str(e)}")
+            question = self.questions[self.current_question_index]
+            worker = DeleteQuestionWorker(
+                self.json_file_path, 
+                question.uid,
+                self.index_file_path, 
+                self.index
+            )
+            worker.signals.finished.connect(self.handle_delete_finished)
+            worker.signals.error.connect(self.handle_delete_error)
+            self.threadpool.start(worker)
+
+    def handle_delete_finished(self):
+        if self.current_question_index is not None:
+            deleted_question = self.questions[self.current_question_index]
+            # Remove from the questions list
+            self.questions.pop(self.current_question_index)
+            self.current_question_index = None
+            self.populate_list()
+            self.question_form.clear()
+
+            # Show success message
+            QMessageBox.information(self, "Success", "Question deleted successfully!")
+            
+            # Clear any selections
+            self.question_list.clearSelection()
+            self.save_question_btn.setVisible(False)
+            self.delete_btn.setVisible(False)
+
+    def handle_delete_error(self, error):
+        QMessageBox.critical(self, "Error", f"Failed to delete question: {str(error)}")
 
     def save_changes(self):
         json_utils.save_index(self.index, self.index_file_path)
@@ -559,8 +672,7 @@ class QuestionManagerWidget(QWidget):
             try:
                 # Calculate which UIDs to load next
                 current_uids = {q.uid for q in self.questions}
-                all_uids = list(self.index.keys())
-                next_uids = [uid for uid in all_uids if uid not in current_uids][:self.chunk_size]
+                next_uids = [uid for uid in self.index if uid not in current_uids][:self.chunk_size]
                 
                 # Load next chunk of questions
                 for uid in next_uids:
@@ -602,32 +714,24 @@ class QuestionManagerWidget(QWidget):
             QApplication.processEvents()
 
             try:
-                is_new_question = self.current_question_index is None
-                
-                if is_new_question:
-                    # Ensure new question gets new UID
-                    question.uid = str(uuid4())
-                    json_utils.append_question(self.json_file_path, question)
-                    self.questions.append(question)
-                    if self.index is not None:
-                        self.index[question.uid] = question.to_dict()
+                if self.current_question_index is None:
+                    # New question
+                    is_new = True
                 else:
-                    # Update existing - UID should be preserved from original
-                    json_utils.save_questions(
-                        self.json_file_path,
-                        questions_to_update=[question]
-                    )
-                    self.questions[self.current_question_index] = question
-                    if self.index is not None:
-                        self.index[question.uid] = question.to_dict()
+                    # Update existing
+                    existing_question = self.questions[self.current_question_index]
+                    question.uid = existing_question.uid
+                    is_new = False
 
-                # Save index
-                if self.index is not None and self.index_file_path:
-                    json_utils.save_index(self.index, self.index_file_path)
-
-                # Update UI
-                self.populate_list()
-                QMessageBox.information(self, "Success", "Question saved successfully!")
+                worker = SaveQuestionWorker(
+                    self.json_file_path, question, 
+                    self.index_file_path, self.index, 
+                    is_new
+                )
+                worker.signals.result.connect(self.handle_save_result)
+                worker.signals.error.connect(self.handle_save_error)
+                worker.signals.finished.connect(lambda: self.setEnabled(True))
+                self.threadpool.start(worker)
 
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to save question: {str(e)}")
@@ -639,7 +743,28 @@ class QuestionManagerWidget(QWidget):
 
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to process question data: {str(e)}")
-        
+
+    def handle_save_result(self, question):
+        if self.current_question_index is None:
+            self.questions.append(question)
+            if self.index is not None and question.uid not in self.index:
+                self.index.append(question.uid)
+        else:
+            self.questions[self.current_question_index] = question
+            if self.index is not None and question.uid not in self.index:
+                self.index.append(question.uid)
+
+        # Save index
+        if self.index is not None and self.index_file_path:
+            json_utils.save_index(self.index, self.index_file_path)
+
+        # Update UI
+        self.populate_list()
+        QMessageBox.information(self, "Success", "Question saved successfully!")
+
+    def handle_save_error(self, error):
+        QMessageBox.critical(self, "Error", f"Failed to save question: {str(error)}")
+
     def save_changes(self):
         """Save index changes on application exit."""
         if self.index is not None and self.index_file_path:
@@ -670,21 +795,7 @@ class MainWindow(QMainWindow):
         
         # Connect aboutToQuit signal to save_changes
         QApplication.instance().aboutToQuit.connect(question_manager_tab.save_changes)
-    
-    def closeEvent(self, event):
-        """Ensure all changes are saved before closing."""
-        # Find the question manager tab
-        for i in range(self.centralWidget().count()):
-            tab = self.centralWidget().widget(i)
-            if isinstance(tab, QuestionManagerWidget):
-                if tab.index and tab.index_file_path:
-                    try:
-                        json_utils.save_index(tab.index, tab.index_file_path)
-                    except Exception as e:
-                        QMessageBox.warning(self, "Warning", 
-                            f"Failed to save some changes: {str(e)}")
-        event.accept()
-        
+
 def main():
     app = QApplication(sys.argv)
     window = MainWindow()
