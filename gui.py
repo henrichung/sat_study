@@ -4,13 +4,14 @@ PyQt GUI for the SAT Worksheet Generator and SAT Question Generator.
 This application now provides three tabs:
   • Worksheet Generator
   • Question Generator
-  • Question Browser (new): Browse, filter, edit, and delete questions.
+  • Question Manager (new): Browse, filter, edit, and delete questions.
 """
 import sys
 import os
 import random
 import json
 import json_utils
+from uuid import uuid4
 from types import SimpleNamespace
 
 from PyQt5.QtWidgets import (QApplication, QWidget, QMainWindow, QFileDialog,
@@ -92,17 +93,6 @@ class QuestionFormWidget(QWidget):
         
         self.setLayout(form_layout)
 
-        # Connect change signals to mark_dirty
-        self.question_text_edit.textChanged.connect(self._mark_dirty)
-        self.question_image_edit.textChanged.connect(self._mark_dirty)
-        for opt in ['A', 'B', 'C', 'D']:
-            self.option_edits[opt]['text'].textChanged.connect(self._mark_dirty)
-            self.option_edits[opt]['image'].textChanged.connect(self._mark_dirty)
-        self.correct_answer_combo.currentTextChanged.connect(self._mark_dirty)
-        self.difficulty_edit.textChanged.connect(self._mark_dirty)
-        self.tags_edit.textChanged.connect(self._mark_dirty)
-        self.explanation_text_edit.textChanged.connect(self._mark_dirty)
-
     def browse_question_image(self):
         filename, _ = QFileDialog.getOpenFileName(self, "Select Question Image", "", 
             "Image Files (*.png *.jpg *.jpeg *.bmp *.gif)")
@@ -115,129 +105,96 @@ class QuestionFormWidget(QWidget):
         if filename:
             line_edit.setText(filename)
 
-    def get_question_data(self):
-        data = {
-            "question": {
-                "text": self.question_text_edit.toPlainText().strip(),
-                "image": self.question_image_edit.text().strip()
-            },
-            "options": {
-                opt: {
-                    "text": self.option_edits[opt]['text'].text().strip(),
-                    "image": self.option_edits[opt]['image'].text().strip()
-                } for opt in ['A', 'B', 'C', 'D']
-            },
-            "answer": self.correct_answer_combo.currentText(),
-            "difficulty": self.difficulty_edit.text().strip(),
-            "tags": [t.strip() for t in self.tags_edit.text().split(",") if t.strip()],
-            "explanation": {
-                "text": self.explanation_text_edit.toPlainText().strip()
-            },
-            "_dirty": self.is_dirty  # Add dirty flag to the data
-        }
-        self.is_dirty = False  # Reset dirty flag after getting data
-        return data
+    def _compare_questions(self, q1: json_utils.Question, q2: json_utils.Question) -> bool:
+        """Compare two questions for equality, avoiding nested object comparison."""
+        if q1 is None or q2 is None:
+            return q1 is q2
 
-    def set_question_data(self, question):
+        # Convert both questions to dictionaries for flat comparison
+        try:
+            dict1 = q1.to_dict() if hasattr(q1, 'to_dict') else {}
+            dict2 = q2.to_dict() if hasattr(q2, 'to_dict') else {}
+            return dict1 == dict2
+        except Exception:
+            return False
+
+    def get_question_data(self):
+        """Get the current form data as a Question object."""
+        # Create nested objects first
+        content = json_utils.QuestionContent(
+            text=self.question_text_edit.toPlainText().strip(),
+            image=self.question_image_edit.text().strip() or None
+        )
+        
+        options = {
+            opt: json_utils.QuestionOption(
+                text=self.option_edits[opt]['text'].text().strip(),
+                image=self.option_edits[opt]['image'].text().strip() or None
+            ) for opt in ['A', 'B', 'C', 'D']
+        }
+        
+        explanation = json_utils.QuestionExplanation(
+            text=self.explanation_text_edit.toPlainText().strip()
+        )
+        
+        # Explicitly handle UID
+        existing_uid = self.original_data.uid if self.original_data else None
+        
+        # Create Question object with explicit UID handling
+        question = json_utils.Question(
+            content=content,
+            options=options,
+            answer=self.correct_answer_combo.currentText(),
+            difficulty=self.difficulty_edit.text().strip(),
+            tags=[t.strip() for t in self.tags_edit.text().split(",") if t.strip()],
+            explanation=explanation,
+            uid=existing_uid  # Pass existing UID or None for new questions
+        )
+        
+        # Set dirty flag based on whether this is a new question or data has changed
+        is_dirty = not self._compare_questions(question, self.original_data)
+        question._dirty = is_dirty
+        return question
+
+    def set_question_data(self, question: json_utils.Question):
+        """Set form data from a Question object."""
         if not question:
             self.clear()
             return
-
-        # Store a deep copy of the original question data
-        self.original_data = question.copy()
-
-        self.question_text_edit.setPlainText(question.get("question", {}).get("text", ""))
-        self.question_image_edit.setText(question.get("question", {}).get("image", ""))
+            
+        # Store original question
+        self.original_data = question
         
-        options = question.get("options", {})
-        for opt in ['A', 'B', 'C', 'D']:
-            option_data = options.get(opt, {})
-            if isinstance(option_data, str):  # Handle legacy format
-                self.option_edits[opt]['text'].setText(option_data)
-                self.option_edits[opt]['image'].setText("")
-            else:
-                self.option_edits[opt]['text'].setText(option_data.get("text", ""))
-                self.option_edits[opt]['image'].setText(option_data.get("image", ""))
+        # Set form fields
+        self.question_text_edit.setPlainText(question.content.text)
+        self.question_image_edit.setText(question.content.image or "")
         
-        answer = question.get("answer", "A")
-        idx = self.correct_answer_combo.findText(answer)
+        for opt, option_data in question.options.items():
+            self.option_edits[opt]['text'].setText(option_data.text)
+            self.option_edits[opt]['image'].setText(option_data.image or "")
+        
+        idx = self.correct_answer_combo.findText(question.answer)
         if idx >= 0:
             self.correct_answer_combo.setCurrentIndex(idx)
             
-        self.difficulty_edit.setText(question.get("difficulty", ""))
-        self.tags_edit.setText(", ".join(question.get("tags", [])))
-        self.explanation_text_edit.setPlainText(question.get("explanation", {}).get("text", ""))
+        self.difficulty_edit.setText(question.difficulty)
+        self.tags_edit.setText(", ".join(question.tags))
+        self.explanation_text_edit.setPlainText(question.explanation.text)
 
-    def get_question_data(self):
-        current_data = {
-            "question": {
-                "text": self.question_text_edit.toPlainText().strip(),
-                "image": self.question_image_edit.text().strip()
-            },
-            "options": {
-                opt: {
-                    "text": self.option_edits[opt]['text'].text().strip(),
-                    "image": self.option_edits[opt]['image'].text().strip()
-                } for opt in ['A', 'B', 'C', 'D']
-            },
-            "answer": self.correct_answer_combo.currentText(),
-            "difficulty": self.difficulty_edit.text().strip(),
-            "tags": [t.strip() for t in self.tags_edit.text().split(",") if t.strip()],
-            "explanation": {
-                "text": self.explanation_text_edit.toPlainText().strip()
-            }
-        }
-
-        # Compare with original data to determine if dirty
-        is_dirty = self._is_data_changed(current_data)
-        current_data["_dirty"] = is_dirty
-        return current_data
-
-    def _is_data_changed(self, current_data):
-        if self.original_data is None:
-            return True
-
-        # Compare relevant fields
-        fields_to_compare = [
-            ("question", ["text", "image"]),
-            ("options", ["A", "B", "C", "D"]),
-            ("answer", None),
-            ("difficulty", None),
-            ("tags", None),
-            ("explanation", ["text"])
-        ]
-
-        for field, subfields in fields_to_compare:
-            if field not in self.original_data or field not in current_data:
-                return True
-
-            if subfields is None:
-                if self.original_data[field] != current_data[field]:
-                    return True
-            else:
-                orig = self.original_data[field]
-                curr = current_data[field]
-                
-                if isinstance(orig, dict) and isinstance(curr, dict):
-                    for subfield in subfields:
-                        if subfield in orig and subfield in curr:
-                            if isinstance(orig[subfield], dict) and isinstance(curr[subfield], dict):
-                                if orig[subfield].get("text") != curr[subfield].get("text") or \
-                                   orig[subfield].get("image") != curr[subfield].get("image"):
-                                    return True
-                            elif orig[subfield] != curr[subfield]:
-                                return True
-                        else:
-                            return True
-
-        return False
-    
     def clear(self):
-        super().clear()
+        """Clear all form fields and reset state."""
+        self.question_text_edit.clear()
+        self.question_image_edit.clear()
+        
+        for opt in self.option_edits.values():
+            opt['text'].clear()
+            opt['image'].clear()
+            
+        self.correct_answer_combo.setCurrentIndex(0)
+        self.difficulty_edit.clear()
+        self.tags_edit.clear()
+        self.explanation_text_edit.clear()
         self.original_data = None
-
-    def _mark_dirty(self):
-        self.is_dirty = True
 
 # -------------------- Worksheet Generator Widget -------------------- #
 class WorksheetGeneratorWidget(QWidget):
@@ -354,69 +311,8 @@ class WorksheetGeneratorWidget(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"An error occurred:\n{str(e)}")
 
-# -------------------- Question Generator Widget -------------------- #
-class QuestionGeneratorWidget(QWidget):
-    def __init__(self):
-        super().__init__()
-        self.init_ui()
-
-    def init_ui(self):
-        layout = QVBoxLayout()
-        
-        # JSON file selection
-        file_layout = QHBoxLayout()
-        self.json_file_edit = QLineEdit()
-        self.json_file_edit.setPlaceholderText("Select or enter target JSON file")
-        json_btn = QPushButton("Browse...")
-        json_btn.clicked.connect(self.browse_json_file)
-        file_layout.addWidget(self.json_file_edit)
-        file_layout.addWidget(json_btn)
-        layout.addLayout(file_layout)
-        
-        # Question form
-        self.question_form = QuestionFormWidget()
-        layout.addWidget(self.question_form)
-        
-        # Buttons
-        button_layout = QHBoxLayout()
-        self.save_question_btn = QPushButton("Save Question")
-        self.save_question_btn.clicked.connect(self.save_question)
-        self.clear_fields_btn = QPushButton("Clear Fields")
-        self.clear_fields_btn.clicked.connect(self.clear_fields)
-        button_layout.addWidget(self.save_question_btn)
-        button_layout.addWidget(self.clear_fields_btn)
-        layout.addLayout(button_layout)
-        
-        self.setLayout(layout)
-
-    def save_question(self):
-        json_file = self.json_file_edit.text().strip()
-        if not json_file:
-            QMessageBox.critical(self, "Error", "Please specify the output JSON file.")
-            return
-
-        question_dict = self.question_form.get_question_data()
-        
-        try:
-            # Create Question object from dictionary
-            question = json_utils.Question.from_dict(question_dict)
-            # Now pass both the json_file path and Question object
-            json_utils.append_question(json_file, question)
-            QMessageBox.information(self, "Success", "Question saved successfully!")
-            self.clear_fields()
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to save question:\n{str(e)}")
-
-    def clear_fields(self):
-        self.question_form.clear()
-
-    def browse_json_file(self):
-        filename, _ = QFileDialog.getSaveFileName(self, "Select or Create JSON File", "", "JSON Files (*.json)")
-        if filename:
-            self.json_file_edit.setText(filename)
-
-# -------------------- New: Question Browser Widget -------------------- #
-class QuestionBrowserWidget(QWidget):
+# -------------------- New: Question Manager Widget -------------------- #
+class QuestionManagerWidget(QWidget):
     def __init__(self):
         super().__init__()
         self.questions = []
@@ -476,9 +372,20 @@ class QuestionBrowserWidget(QWidget):
         
         # Buttons
         button_layout = QHBoxLayout()
-        delete_btn = QPushButton("Delete Question")
-        delete_btn.clicked.connect(self.delete_question)
-        button_layout.addWidget(delete_btn)
+        add_btn = QPushButton("Add Question")
+        add_btn.clicked.connect(self.add_new_question)
+        self.delete_btn = QPushButton("Delete Question")  # Store as instance variable
+        self.delete_btn.clicked.connect(self.delete_question)
+        self.save_question_btn = QPushButton("Save")
+        self.save_question_btn.clicked.connect(self.save_question)  # Connect to new method
+        self.save_question_btn.setVisible(False)
+        self.clear_fields_btn = QPushButton("Clear Fields")
+        self.clear_fields_btn.clicked.connect(self.clear_fields)
+        
+        button_layout.addWidget(add_btn)
+        button_layout.addWidget(self.delete_btn)  # Use instance variable
+        button_layout.addWidget(self.save_question_btn)
+        button_layout.addWidget(self.clear_fields_btn)
         layout.addLayout(button_layout)
         
         self.setLayout(layout)
@@ -492,6 +399,28 @@ class QuestionBrowserWidget(QWidget):
     def filter_questions(self):
         search_text = self.filter_edit.text()
         self.proxyModel.setFilterRegExp(search_text)
+
+    def initialize_index(self):
+        """Initialize or load the question index for the current JSON file."""
+        if not self.index_file_path:
+            return {}
+            
+        try:
+            if os.path.exists(self.index_file_path):
+                self.index = json_utils.load_index(self.index_file_path)
+            else:
+                self.index = json_utils.create_index(self.json_file_path, self.index_file_path)
+            
+            # Handle potential errors during index creation
+            if self.index is None:
+                self.index = {}
+                
+            return self.index
+                
+        except Exception as e:
+            QMessageBox.warning(self, "Index Error", 
+                f"Failed to initialize index:\n{str(e)}\nUsing empty index.")
+            return {}
 
     def load_questions(self):
         self.json_file_path = self.json_file_edit.text().strip()
@@ -507,15 +436,8 @@ class QuestionBrowserWidget(QWidget):
             # Load questions directly first to validate JSON
             questions = json_utils.load_questions(self.json_file_path)
             
-            # Initialize or load index
-            if os.path.exists(self.index_file_path):
-                self.index = json_utils.load_index(self.index_file_path)
-            else:
-                self.index = json_utils.create_index(self.json_file_path, self.index_file_path)
-                
-            # Ensure index is not None
-            if self.index is None:
-                self.index = {}
+            # Initialize index after JSON validation
+            self.index = self.initialize_index()
             
             # Clear existing data
             self.questions = questions
@@ -537,15 +459,23 @@ class QuestionBrowserWidget(QWidget):
             QMessageBox.critical(self, "Error", f"Failed to load questions: {str(e)}")
 
     def populate_list(self):
+        """Populate the list with Question objects."""
         self.model.clear()
         for i, question in enumerate(self.questions):
-            question_text = question.text[:50] if hasattr(question, 'text') else ""
-            display_text = f"{i+1}: {question_text}"
+            # Safely extract question text for display
+            try:
+                text = question.content.text if hasattr(question, 'content') else str(question)
+                text = text[:50] if text else "Untitled Question"
+            except (AttributeError, TypeError):
+                text = "Untitled Question"
+            
+            display_text = f"{i+1}: {text}"
             item = QStandardItem(display_text)
-            item.setData(question.uid, Qt.UserRole)  # Store question UID instead of index
+            item.setData(question.uid, Qt.UserRole)
             self.model.appendRow(item)
 
     def on_question_selected(self):
+        """Handle question selection."""
         selected_indexes = self.question_list.selectedIndexes()
         if not selected_indexes:
             self.current_question_index = None
@@ -565,29 +495,23 @@ class QuestionBrowserWidget(QWidget):
         
         if self.current_question_index is not None:
             question = self.questions[self.current_question_index]
-            self.question_form.set_question_data(question.to_dict())
+            self.question_form.set_question_data(question)
+            self.save_question_btn.setVisible(True)
+            self.delete_btn.setVisible(True)
 
     def commit_current_question(self):
+        """Check if current question is dirty and save if needed."""
         if self.current_question_index is None:
             return
             
         updated_data = self.question_form.get_question_data()
-        if updated_data.pop('_dirty', False):
-            question = self.questions[self.current_question_index]
-            json_utils.update_question(self.json_file_path, question.uid, updated_data)
-            # Update index if needed (e.g., if tags changed)
-            self.index = json_utils.update_index(self.index, question.uid, updated_data)
-            json_utils.save_index(self.index, self.index_file_path)
-            
-            # Update in-memory question
-            self.questions[self.current_question_index] = json_utils.Question.from_dict(updated_data)
-        
-        self.populate_list()
+        if updated_data._dirty:
+            self.save_question()  # Use unified save logic
 
     def delete_question(self):
         if self.current_question_index is None:
             return
-            
+                
         reply = QMessageBox.question(
             self, "Delete Question",
             "Are you sure you want to delete this question?",
@@ -595,19 +519,30 @@ class QuestionBrowserWidget(QWidget):
         )
         
         if reply == QMessageBox.Yes:
-            question = self.questions[self.current_question_index]
-            json_utils.delete_question(self.json_file_path, question.uid)
-            
-            # Update index
-            if question.uid in self.index:
-                del self.index[question.uid]
-                json_utils.save_index(self.index, self.index_file_path)
-            
-            # Remove from questions list
-            self.questions.pop(self.current_question_index)
-            self.current_question_index = None
-            self.populate_list()
-            self.question_form.clear()
+            try:
+                question = self.questions[self.current_question_index]
+                
+                # Delete from file and index
+                json_utils.delete_question(self.json_file_path, self.index, question.uid)
+                
+                # Save index changes immediately
+                if self.index_file_path:
+                    json_utils.save_index(self.index, self.index_file_path)
+                
+                # Remove from questions list
+                self.questions.pop(self.current_question_index)
+                self.current_question_index = None
+                
+                # Update UI
+                self.populate_list()
+                self.question_form.clear()
+                self.save_question_btn.setVisible(False)
+                self.delete_btn.setVisible(False)
+                
+                QMessageBox.information(self, "Success", "Question deleted successfully")
+                
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to delete question: {str(e)}")
 
     def save_changes(self):
         json_utils.save_index(self.index, self.index_file_path)
@@ -637,6 +572,85 @@ class QuestionBrowserWidget(QWidget):
                     self.populate_list()
             finally:
                 self.loading_more = False
+
+    def add_new_question(self):
+        """Handler for Add Question button clicks."""
+        self.current_question_index = None  # Signify creating new question
+        self.question_form.clear()  # Clear the form
+        self.save_question_btn.setVisible(True)  # Show save button
+        self.delete_btn.setVisible(False)  # Hide delete button
+        self.question_list.clearSelection()  # Deselect any selected question
+
+    def save_question(self):
+        """Save the current question, handling both new questions and updates."""
+        if not self.json_file_path:
+            QMessageBox.critical(self, "Error", "Please select a JSON file first.")
+            return
+
+        try:
+            # Get question object
+            question = self.question_form.get_question_data()
+            is_dirty = getattr(question, '_dirty', True)
+            if hasattr(question, '_dirty'):
+                delattr(question, '_dirty')
+            
+            if not is_dirty:
+                return
+
+            # Disable UI during save
+            self.setEnabled(False)
+            QApplication.processEvents()
+
+            try:
+                is_new_question = self.current_question_index is None
+                
+                if is_new_question:
+                    # Ensure new question gets new UID
+                    question.uid = str(uuid4())
+                    json_utils.append_question(self.json_file_path, question)
+                    self.questions.append(question)
+                    if self.index is not None:
+                        self.index[question.uid] = question.to_dict()
+                else:
+                    # Update existing - UID should be preserved from original
+                    json_utils.save_questions(
+                        self.json_file_path,
+                        questions_to_update=[question]
+                    )
+                    self.questions[self.current_question_index] = question
+                    if self.index is not None:
+                        self.index[question.uid] = question.to_dict()
+
+                # Save index
+                if self.index is not None and self.index_file_path:
+                    json_utils.save_index(self.index, self.index_file_path)
+
+                # Update UI
+                self.populate_list()
+                QMessageBox.information(self, "Success", "Question saved successfully!")
+
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to save question: {str(e)}")
+                return
+
+            finally:
+                self.setEnabled(True)
+                QApplication.processEvents()
+
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to process question data: {str(e)}")
+        
+    def save_changes(self):
+        """Save index changes on application exit."""
+        if self.index is not None and self.index_file_path:
+            try:
+                json_utils.save_index(self.index, self.index_file_path)
+            except Exception as e:
+                logging.error(f"Failed to save index on exit: {str(e)}")
+
+    def clear_fields(self):
+        """Clear all form fields and reset state."""
+        self.question_form.clear()
                 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -646,18 +660,31 @@ class MainWindow(QMainWindow):
         self.init_ui()
 
     def init_ui(self):
+        # Remove duplicate init_ui call
         tab_widget = QTabWidget()
         worksheet_tab = WorksheetGeneratorWidget()
-        question_tab = QuestionGeneratorWidget()
-        question_browser_tab = QuestionBrowserWidget()  # New tab for browsing/editing questions
+        question_manager_tab = QuestionManagerWidget()
         tab_widget.addTab(worksheet_tab, "Worksheet Generator")
-        tab_widget.addTab(question_tab, "Question Generator")
-        tab_widget.addTab(question_browser_tab, "Question Browser")
+        tab_widget.addTab(question_manager_tab, "Question Manager")
         self.setCentralWidget(tab_widget)
         
         # Connect aboutToQuit signal to save_changes
-        QApplication.instance().aboutToQuit.connect(question_browser_tab.save_changes)
-
+        QApplication.instance().aboutToQuit.connect(question_manager_tab.save_changes)
+    
+    def closeEvent(self, event):
+        """Ensure all changes are saved before closing."""
+        # Find the question manager tab
+        for i in range(self.centralWidget().count()):
+            tab = self.centralWidget().widget(i)
+            if isinstance(tab, QuestionManagerWidget):
+                if tab.index and tab.index_file_path:
+                    try:
+                        json_utils.save_index(tab.index, tab.index_file_path)
+                    except Exception as e:
+                        QMessageBox.warning(self, "Warning", 
+                            f"Failed to save some changes: {str(e)}")
+        event.accept()
+        
 def main():
     app = QApplication(sys.argv)
     window = MainWindow()
