@@ -1,0 +1,11 @@
+ 1. Database Migration - Replace JSON file storage with SQLite for better performance, atomicity, and reduced memory footprint when handling large
+  question banks.
+2. LaTeX Rendering Optimization - Implement a more efficient LaTeX rendering pipeline with proper caching to disk instead of just in-memory caching.        
+3. Question Preview Panel - Add a preview pane showing rendered LaTeX and images when editing questions.
+4. Background Processing for Worksheets - Improve worksheet generation to show progress and run fully in background.
+5. Error Handling Improvements - Add more specific error messages and recovery options throughout the application.
+6. Bulk Operations - Add support for bulk import/export and batch question editing features.
+7. Enhanced Search & Filtering - Implement advanced search with multiple tag selection and difficulty filtering.
+8. Worksheet Templates - Create and save worksheet templates with predefined settings.
+9. Unit Tests - Add comprehensive test suite to ensure stability during further development.
+10. UI/UX Enhancements - Improve layout, add keyboard shortcuts, and implement drag-and-drop reordering of questions.
