@@ -12,7 +12,7 @@ import logging
 
 # Add parent directory to path so we can import json_utils
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import json_utils
+from src.data import json_utils
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
